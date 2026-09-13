@@ -4,83 +4,100 @@ import time
 import json
 import os
 import threading
+import math
+import subprocess
 from collections import defaultdict
 
+# NOTE: Do NOT set OPENCV_FFMPEG_CAPTURE_OPTIONS env var - it's unreliable on Windows.
+# We pass TCP transport directly via VideoCapture() API parameters below.
 import cv2
 import numpy as np
+import insightface
 from ultralytics import YOLO
 from recognition_engine import RecognitionEngine
 
 
 class FrameGrabber:
-    """Threaded frame grabber to ensure the tracker always gets the freshest frame, avoiding RTSP/buffer lag."""
+    """
+    FFmpeg-piped frame grabber. Uses a ffmpeg subprocess with -rtsp_transport tcp
+    to decode HEVC/H.264 RTSP streams without packet loss or reference frame errors.
+    Outputs raw BGR24 frames into a numpy buffer at a capped 15 FPS.
+    """
+    GRAB_WIDTH  = 1280
+    GRAB_HEIGHT = 720
+    GRAB_FPS    = 15
+
     def __init__(self, source_str):
         self.source_str = source_str
-        self.cap = None
         self.frame = None
-        self.ret = False
-        self.running = False
-        self.lock = threading.Lock()
-        self.open_source()
+        self.ret   = False
+        self.lock  = threading.Lock()
+        self.running = True
+        self.proc  = None
+        self._start()
 
-    def open_source(self):
-        if self.source_str.isdigit():
-            idx = int(self.source_str)
-            self.cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(idx)
-        else:
-            self.cap = cv2.VideoCapture(self.source_str, cv2.CAP_FFMPEG)
-        
-        if self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.ret, self.frame = self.cap.read()
+    def _build_cmd(self):
+        is_rtsp = self.source_str.startswith("rtsp://")
+        cmd = ["ffmpeg", "-loglevel", "error"]
+        if is_rtsp:
+            cmd += ["-rtsp_transport", "tcp",
+                    "-timeout", "5000000"]  # 5s connect timeout
+        cmd += [
+            "-i",       self.source_str,
+            "-vf",      f"fps={self.GRAB_FPS},scale={self.GRAB_WIDTH}:{self.GRAB_HEIGHT}",
+            "-pix_fmt", "bgr24",
+            "-vcodec",  "rawvideo",
+            "-an",                      # no audio
+            "-f",       "rawvideo",
+            "pipe:1"
+        ]
+        return cmd
+
+    def _start(self):
+        try:
+            self.proc = subprocess.Popen(
+                self._build_cmd(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
             self.running = True
-            self.thread = threading.Thread(target=self._update, daemon=True)
-            self.thread.start()
+            t = threading.Thread(target=self._read_loop, daemon=True)
+            t.start()
+            print(f"[FrameGrabber] ffmpeg started (TCP, {self.GRAB_WIDTH}x{self.GRAB_HEIGHT} @ {self.GRAB_FPS}fps)")
+        except Exception as e:
+            print(f"[FrameGrabber] Failed to start ffmpeg: {e}")
 
-    def _update(self):
+    def _read_loop(self):
+        frame_bytes = self.GRAB_WIDTH * self.GRAB_HEIGHT * 3
         while self.running:
-            try:
-                if not self.cap or not self.cap.isOpened():
-                    print("[FrameGrabber] Stream lost. Reconnecting in 3s...")
-                    time.sleep(3)
-                    self.open_source()
-                    continue
-                ret, frame = self.cap.read()
-                with self.lock:
-                    self.ret = ret
-                    if ret:
-                        self.frame = frame
-                if not ret:
-                    # Release and let the loop reconnect
-                    self.cap.release()
-                    self.cap = None
-                    continue
-            except Exception as e:
-                # Catch OpenCV C++ exceptions from corrupted HEVC streams
-                print(f"[FrameGrabber] Stream error: {e}. Reconnecting in 3s...")
-                try:
-                    if self.cap:
-                        self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
+            raw = self.proc.stdout.read(frame_bytes)
+            if len(raw) != frame_bytes:
+                print("[FrameGrabber] Stream ended or corrupted. Restarting in 3s...")
                 time.sleep(3)
-                continue
-            # Small sleep to prevent CPU pegging if source is a fast video file
-            time.sleep(0.001)
+                self._start()
+                return
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                (self.GRAB_HEIGHT, self.GRAB_WIDTH, 3)
+            )
+            with self.lock:
+                self.frame = frame
+                self.ret = True
 
     def read(self):
         with self.lock:
             if self.frame is not None:
                 return self.ret, self.frame.copy()
-            return self.ret, None
+            return False, None
 
     def release(self):
         self.running = False
-        if self.cap:
-            self.cap.release()
+        if self.proc:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+            except Exception:
+                pass
 
 
 class ZoneDrawer:
@@ -161,6 +178,58 @@ class ZoneDrawer:
         return np.array(self.pts, dtype=np.int32)
 
 
+class LiveFaceDetector:
+    """Lightweight asynchronous Face Detector for on-screen visualization.
+    Uses a fast model and skips frames to avoid competing with YOLO for GPU."""
+    def __init__(self):
+        print("Loading LiveFaceDetector (lightweight scrfd_500m for visualization)...")
+        # Use scrfd_500m_bnkps — much lighter than buffalo_l, sufficient for visualization
+        self.app = insightface.app.FaceAnalysis(
+            name="buffalo_s",   # lightweight: only 4MB vs 300MB for buffalo_l
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            allowed_modules=["detection"]  # detection only — skip recognition to save GPU
+        )
+        self.app.prepare(ctx_id=0, det_size=(320, 320))  # smaller det_size = much faster
+        self.latest_frame = None
+        self.faces = []
+        self.lock = threading.Lock()
+        self.frame_counter = 0
+        self.skip_frames = 4  # Only run detection every 5th frame submitted
+        self.thread = threading.Thread(target=self._worker, daemon=True, name="LiveFaceDetector")
+        self.thread.start()
+        print("LiveFaceDetector ready.")
+
+    def submit_frame(self, frame):
+        """Non-blocking frame submission. Skips frames to cap GPU usage."""
+        self.frame_counter += 1
+        if self.frame_counter % (self.skip_frames + 1) != 0:
+            return  # skip this frame
+        with self.lock:
+            if self.latest_frame is None:  # only update if worker has finished previous
+                self.latest_frame = frame.copy()
+
+    def get_faces(self):
+        """Returns the latest cached face bounding boxes (thread-safe)."""
+        with self.lock:
+            return list(self.faces)
+
+    def _worker(self):
+        while True:
+            with self.lock:
+                frame = self.latest_frame
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            try:
+                faces = self.app.get(frame)
+                bboxes = [f.bbox for f in faces]
+            except Exception:
+                bboxes = []
+            with self.lock:
+                self.faces = bboxes
+                self.latest_frame = None  # signal worker is idle
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Dense Crowd Zone-Based People Counter")
     parser.add_argument("--source", type=str, default="0", help="Video source (webcam index, RTSP url, video file)")
@@ -222,6 +291,7 @@ def main():
     
     print("Initializing Recognition Engine...")
     engine = RecognitionEngine()
+    live_detector = LiveFaceDetector()
     
     print(f"Loading model: {args.model} (imgsz={args.imgsz}, max_det={args.max_det})")
     
@@ -415,6 +485,15 @@ def main():
             fps = frames_processed / elapsed
             frames_processed = 0
             start_time = now
+
+        # --- Draw Live Face Bounding Boxes ---
+        live_detector.submit_frame(frame)  # Non-blocking, skips frames automatically
+        current_faces = live_detector.get_faces()
+        for bbox in current_faces:
+            x1_f, y1_f, x2_f, y2_f = map(int, bbox)
+            cv2.rectangle(frame, (x1_f, y1_f), (x2_f, y2_f), (255, 0, 255), 2)
+            cv2.putText(frame, "FACE", (x1_f, y1_f - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
 
         # Get true deduplicated count from the recognition engine
         true_processed_count = engine.get_session_unique_count()
