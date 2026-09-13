@@ -203,7 +203,8 @@ class LiveFaceDetector:
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
             allowed_modules=["detection"]  # detection only — skip recognition to save GPU
         )
-        self.app.prepare(ctx_id=0, det_size=(320, 320))  # smaller det_size = much faster
+        # Increase det_size to 1280x1280 to detect tiny faces in 200-300 person dense crowds
+        self.app.prepare(ctx_id=0, det_size=(1280, 1280))
         self.latest_frame = None
         self.faces = []
         self.lock = threading.Lock()
@@ -525,17 +526,22 @@ def main():
                         break
             
             # Draw the box and label
-            cv2.rectangle(frame, (x1_f, y1_f), (x2_f, y2_f), (255, 0, 255), 2)
+            box_thick = 1 if is_dense else 2
+            font_scale = 0.4 if is_dense else 0.6
+            font_thick = 1 if is_dense else 2
+            
+            cv2.rectangle(frame, (x1_f, y1_f), (x2_f, y2_f), (255, 0, 255), box_thick)
             cv2.putText(frame, face_id_label, (x1_f, max(y1_f - 6, 15)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thick, cv2.LINE_AA)
             
             # Draw facial landmarks (datapoints)
             if kps is not None:
+                pt_radius = 1 if is_dense else 2
                 for idx, pt in enumerate(kps):
                     kx, ky = int(pt[0]), int(pt[1])
                     # Alternating red/green dots like the user's reference image
                     color = (0, 255, 0) if idx % 2 == 0 else (0, 0, 255)
-                    cv2.circle(frame, (kx, ky), 2, color, -1)
+                    cv2.circle(frame, (kx, ky), pt_radius, color, -1)
 
         # Get true deduplicated count from the recognition engine
         true_processed_count = engine.get_session_unique_count()
