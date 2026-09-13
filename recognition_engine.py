@@ -4,8 +4,10 @@ import uuid
 import insightface
 import threading
 import queue
+import os
+import time
+import db_manager
 from db_manager import init_db, load_gallery, enroll_person, log_event
-
 
 class RecognitionEngine:
     """
@@ -170,6 +172,10 @@ class RecognitionEngine:
         the zone boundary is counted in the database, even if their face
         is completely invisible.
         """
+        # We will save the first crop as the representative image for this person
+        best_crop = crops[0] if crops else None
+        photo_path = ""
+
         # === STRATEGY 1: Face Recognition (try each crop, take first hit) ===
         for crop in crops:
             embedding = self.get_embedding(crop)
@@ -179,10 +185,20 @@ class RecognitionEngine:
                 if matched_id:
                     person_id = matched_id
                     status = "duplicate_face"
+                    
+                    # Save the crop image for the CSV record
+                    photo_path = os.path.join(db_manager.FACES_DIR, f"{person_id}_{int(time.time())}.jpg")
+                    cv2.imwrite(photo_path, crop)
                 else:
-                    person_id = enroll_person(embedding)
+                    # New face - save it and enroll
+                    person_id = str(uuid.uuid4())
+                    photo_path = os.path.join(db_manager.FACES_DIR, f"{person_id}.jpg")
+                    cv2.imwrite(photo_path, crop)
+                    
+                    # Enroll the person with the new ID and path
+                    db_manager.enroll_person(embedding, photo_path=photo_path)
                     with self._gallery_lock:
-                        self.gallery_ids, self.gallery_matrix = load_gallery()
+                        self.gallery_ids, self.gallery_matrix = db_manager.load_gallery()
                     status = "new_face"
 
                 # Also store body descriptor for cross-method dedup
@@ -190,7 +206,8 @@ class RecognitionEngine:
                 if body_desc is not None:
                     self.body_gallery[person_id] = body_desc
 
-                log_event(person_id=person_id, direction="IN", track_id=track_id)
+                db_manager.log_event(person_id=person_id, direction="IN", track_id=track_id)
+                db_manager.log_event_csv(person_id, track_id, "face", photo_path)
                 self.session_unique_persons.add(person_id)
                 return {
                     "status": status,
@@ -208,12 +225,17 @@ class RecognitionEngine:
                 if matched_id:
                     person_id = matched_id
                     status = "duplicate_body"
+                    photo_path = os.path.join(db_manager.FACES_DIR, f"{person_id}_{int(time.time())}.jpg")
+                    cv2.imwrite(photo_path, crop)
                 else:
                     person_id = str(uuid.uuid4())
                     self.body_gallery[person_id] = body_desc
                     status = "new_body"
+                    photo_path = os.path.join(db_manager.FACES_DIR, f"{person_id}.jpg")
+                    cv2.imwrite(photo_path, crop)
 
-                log_event(person_id=person_id, direction="IN", track_id=track_id)
+                db_manager.log_event(person_id=person_id, direction="IN", track_id=track_id)
+                db_manager.log_event_csv(person_id, track_id, "body", photo_path)
                 self.session_unique_persons.add(person_id)
                 return {
                     "status": status,
@@ -224,7 +246,16 @@ class RecognitionEngine:
 
         # === STRATEGY 3: Guaranteed Count (everything failed) ===
         person_id = str(uuid.uuid4())
-        log_event(person_id=person_id, direction="IN", track_id=track_id)
+        
+        # Still save the crop if we have it
+        if best_crop is None:
+            # Create a blank image if no crops were passed
+            best_crop = np.zeros((100, 100, 3), dtype=np.uint8)
+        photo_path = os.path.join(db_manager.FACES_DIR, f"{person_id}.jpg")
+        cv2.imwrite(photo_path, best_crop)
+
+        db_manager.log_event(person_id=person_id, direction="IN", track_id=track_id)
+        db_manager.log_event_csv(person_id, track_id, "none", photo_path)
         self.session_unique_persons.add(person_id)
         return {
             "status": "new_unknown",

@@ -2,8 +2,15 @@ import sqlite3
 import numpy as np
 import datetime
 import uuid
+import os
+import csv
 
 DB_PATH = "pandal.db"
+FACES_DIR = "faces"
+CSV_PATH = "face_data.csv"
+
+# Ensure faces directory exists
+os.makedirs(FACES_DIR, exist_ok=True)
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -46,7 +53,7 @@ def load_gallery():
     
     return gallery_ids, gallery_matrix
 
-def enroll_person(embedding, photo_path=None):
+def enroll_person(embedding, photo_path=""):
     """Adds a new person to the gallery."""
     person_id = str(uuid.uuid4())
     conn = sqlite3.connect(DB_PATH)
@@ -58,6 +65,20 @@ def enroll_person(embedding, photo_path=None):
     conn.close()
     return person_id
 
+def log_event_csv(person_id, track_id, method, photo_path=""):
+    """Logs an event to the CSV file with face data."""
+    file_exists = os.path.isfile(CSV_PATH)
+    with open(CSV_PATH, mode='a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Timestamp', 'PersonID', 'TrackID', 'Method', 'PhotoPath'])
+        writer.writerow([
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            person_id,
+            track_id,
+            method,
+            photo_path
+        ])
 def log_event(person_id, direction, track_id):
     """Logs an entry or exit event."""
     conn = sqlite3.connect(DB_PATH)
