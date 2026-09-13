@@ -43,3 +43,6 @@ checkpoint_1/
 zone_config.json
 .DS_Store
 Thumbs.db
+*.db
+*.db-wal
+*.db-shm

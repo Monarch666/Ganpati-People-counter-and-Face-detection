@@ -1,9 +1,9 @@
 # Ultralytics ByteTrack configuration for dense crowds (200-300+ people)
+# HARDENED for maximum tracking stability in high-occlusion pandal scenarios
 tracker_type: bytetrack     # Tracker type: ['botsort', 'bytetrack']
-track_high_thresh: 0.35     # Threshold for 1st association stage (detect & match)
-track_low_thresh: 0.10      # Threshold for 2nd association stage (recover occluded)
-new_track_thresh: 0.45      # Minimum confidence to initialize a new track
-track_buffer: 75            # Frames to maintain lost tracks (2.5s @ 30 FPS)
-match_thresh: 0.70          # Hungarian assignment IoU distance threshold
+track_high_thresh: 0.30     # Lower threshold catches more people in 1st association
+track_low_thresh: 0.08      # Very low threshold recovers heavily occluded people
+new_track_thresh: 0.35      # Lower barrier to initialize new tracks in dense crowds
+track_buffer: 120           # 4 seconds of memory @ 30fps (was 75) - keeps IDs alive longer
+match_thresh: 0.80          # Stricter matching = fewer ID switches in dense crowds (was 0.70)
 fuse_score: True            # Fuse detection confidence into IoU similarity score
-

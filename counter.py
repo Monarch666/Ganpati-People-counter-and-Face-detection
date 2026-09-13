@@ -9,6 +9,7 @@ from collections import defaultdict
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from recognition_engine import RecognitionEngine
 
 
 class FrameGrabber:
@@ -39,14 +40,34 @@ class FrameGrabber:
             self.thread.start()
 
     def _update(self):
-        while self.running and self.cap.isOpened():
-            ret, frame = self.cap.read()
-            with self.lock:
-                self.ret = ret
-                if ret:
-                    self.frame = frame
-            if not ret:
-                break
+        while self.running:
+            try:
+                if not self.cap or not self.cap.isOpened():
+                    print("[FrameGrabber] Stream lost. Reconnecting in 3s...")
+                    time.sleep(3)
+                    self.open_source()
+                    continue
+                ret, frame = self.cap.read()
+                with self.lock:
+                    self.ret = ret
+                    if ret:
+                        self.frame = frame
+                if not ret:
+                    # Release and let the loop reconnect
+                    self.cap.release()
+                    self.cap = None
+                    continue
+            except Exception as e:
+                # Catch OpenCV C++ exceptions from corrupted HEVC streams
+                print(f"[FrameGrabber] Stream error: {e}. Reconnecting in 3s...")
+                try:
+                    if self.cap:
+                        self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+                time.sleep(3)
+                continue
             # Small sleep to prevent CPU pegging if source is a fast video file
             time.sleep(0.001)
 
@@ -143,7 +164,7 @@ class ZoneDrawer:
 def parse_args():
     parser = argparse.ArgumentParser(description="Dense Crowd Zone-Based People Counter")
     parser.add_argument("--source", type=str, default="0", help="Video source (webcam index, RTSP url, video file)")
-    parser.add_argument("--model", type=str, default="yolov8s.pt", help="YOLO model (default: yolov8s.pt for dense crowds)")
+    parser.add_argument("--model", type=str, default="yolov8m.pt", help="YOLO model (default: yolov8m.pt for dense crowds)")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold (default: 0.25)")
     parser.add_argument("--imgsz", type=int, default=1280, help="Inference resolution (default: 1280)")
     parser.add_argument("--max-det", type=int, default=1000, help="Max detections per frame (default: 1000)")
@@ -179,9 +200,8 @@ def draw_hud(frame, total_entered, total_exited, live_occupancy, fps, active_tra
     font = cv2.FONT_HERSHEY_DUPLEX
     
     # Enter / Exit / Inside
-    cv2.putText(frame, f"ENTERED: {total_entered}", (20, 42), font, 0.75, (50, 220, 80), 2, cv2.LINE_AA)
-    cv2.putText(frame, f"EXITED: {total_exited}", (230, 42), font, 0.75, (60, 80, 240), 2, cv2.LINE_AA)
-    cv2.putText(frame, f"INSIDE NOW: {live_occupancy}", (430, 42), font, 0.75, (240, 220, 60), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"TOTAL COUNTED: {total_entered}", (20, 42), font, 0.75, (50, 220, 80), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"PROCESSING ZONE: {live_occupancy}", (430, 42), font, 0.75, (240, 220, 60), 2, cv2.LINE_AA)
 
     # Stats
     stats_text = f"FPS: {fps:.1f} | Active: {active_tracks}"
@@ -199,6 +219,10 @@ def main():
     print("=" * 60)
     print("   Zone-Based Dense Queue Counting (YOLOv8 + ByteTrack)")
     print("=" * 60)
+    
+    print("Initializing Recognition Engine...")
+    engine = RecognitionEngine()
+    
     print(f"Loading model: {args.model} (imgsz={args.imgsz}, max_det={args.max_det})")
     
     model = YOLO(args.model)
@@ -236,9 +260,11 @@ def main():
     track_last_seen = {}        # ID -> frame_index (for stale cleanup)
     track_history = defaultdict(list) # ID -> list of (cx, cy) points for drawing trails
     
-    total_entered = 0
-    total_exited = 0
+    total_entered = 0  # Not strictly used on HUD anymore, but kept for state
+    total_exited = 0   # Not strictly used on HUD anymore, but kept for state
     draw_trails = True
+    counted_tracks = set()      # IDs successfully processed/counted (prevents double processing)
+    track_crops = {}            # ID -> list of body crops (multi-frame evidence)
 
     fps = 0.0
     frame_idx = 0
@@ -248,9 +274,9 @@ def main():
     while True:
         ret, frame = grabber.read()
         if not ret or frame is None:
-            if not args.source.isdigit():
-                print("End of stream.")
-            break
+            # Don't crash - just skip this frame and wait for reconnect
+            time.sleep(0.1)
+            continue
             
         frame_idx += 1
         if frame_idx % args.skip_frames != 0:
@@ -265,6 +291,7 @@ def main():
             persist=True,
             classes=[0],           # only persons
             conf=args.conf,
+            iou=0.60,              # Lower IoU allows detecting highly overlapping people in dense queues
             imgsz=args.imgsz,
             max_det=args.max_det,
             verbose=False,
@@ -292,28 +319,57 @@ def main():
                 feet_x = float((x1 + x2) / 2.0)
                 feet_y = float(y2)
                 
+                # --- Multi-frame crop accumulation ---
+                # We want to collect the best, largest crops of the person.
+                # If they are not yet counted, we keep upgrading the best crops.
+                if track_id not in counted_tracks:
+                    crop = frame[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)].copy()
+                    crop_area = crop.shape[0] * crop.shape[1]
+                    if crop_area > 500:  # Minimum viable crop size
+                        if track_id not in track_crops:
+                            track_crops[track_id] = []
+                        crops_list = track_crops[track_id]
+                        if len(crops_list) < 5:
+                            crops_list.append(crop)
+                        else:
+                            # Replace the smallest crop with this one if larger
+                            areas = [c.shape[0] * c.shape[1] for c in crops_list]
+                            min_idx = int(np.argmin(areas))
+                            if crop_area > areas[min_idx]:
+                                crops_list[min_idx] = crop
+
                 # Check polygon inclusion (>= 0 means inside)
                 is_inside = cv2.pointPolygonTest(zone_poly, (feet_x, feet_y), False) >= 0
                 
                 # State transitions
                 if is_inside:
                     if track_id not in tracks_inside:
-                        total_entered += 1
                         tracks_inside.add(track_id)
-                        print(f"[EVENT] ID {track_id} ENTERED zone. Total: {total_entered}")
+                        print(f"[TRACKING] ID {track_id} entered zone (collecting evidence...)")
                 else:
                     if track_id in tracks_inside:
-                        total_exited += 1
                         tracks_inside.remove(track_id)
-                        print(f"[EVENT] ID {track_id} EXITED zone. Total: {total_exited}")
+                        
+                        # Process upon EXIT instead of ENTRY!
+                        if track_id not in counted_tracks:
+                            counted_tracks.add(track_id)
+                            print(f"[EVENT] ID {track_id} EXITED zone. Submitting to Recognition Engine.")
+                            
+                            crops_to_send = track_crops.pop(track_id, None)
+                            if not crops_to_send:
+                                crop = frame[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)].copy()
+                                crops_to_send = [crop] if crop.shape[0] > 0 and crop.shape[1] > 0 else []
+                            if crops_to_send:
+                                engine.enqueue_entry_crossing(crops_to_send, track_id)
 
                 # Drawing boxes and feet anchors
                 box_color = (0, 255, 128) if is_inside else (255, 180, 0)
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), box_color, 2)
-                cv2.circle(frame, (int(feet_x), int(feet_y)), 5, (0, 0, 255), -1)  # Feet anchor
+                box_thickness = 1 if is_dense else 2
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), box_color, box_thickness)
                 
-                # Bounding box label (only if not extremely dense)
+                # Only draw feet anchors and labels if not a massive crowd (to prevent visual clutter)
                 if not is_dense:
+                    cv2.circle(frame, (int(feet_x), int(feet_y)), 5, (0, 0, 255), -1)  # Feet anchor
                     cv2.putText(frame, f"ID: {track_id}", (int(x1), max(int(y1) - 8, 15)), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2, cv2.LINE_AA)
 
@@ -335,13 +391,19 @@ def main():
             stale_ids = [tid for tid, last_frame in track_last_seen.items() if (frame_idx - last_frame) > stale_threshold]
             for tid in stale_ids:
                 if tid in tracks_inside:
-                    # They disappeared while inside. We count them as exited to balance occupancy.
-                    total_exited += 1
                     tracks_inside.remove(tid)
-                    print(f"[CLEANUP] ID {tid} dropped while inside zone. Auto-exited.")
+                    
+                    # They disappeared while inside. We treat this as an EXIT and process them!
+                    if tid not in counted_tracks:
+                        counted_tracks.add(tid)
+                        print(f"[CLEANUP] ID {tid} dropped inside zone. Auto-submitting to engine.")
+                        crops_to_send = track_crops.pop(tid, None)
+                        if crops_to_send:
+                            engine.enqueue_entry_crossing(crops_to_send, tid)
                 del track_last_seen[tid]
                 if tid in track_history:
                     del track_history[tid]
+                track_crops.pop(tid, None)
 
         live_occupancy = len(tracks_inside)
         
@@ -354,7 +416,10 @@ def main():
             frames_processed = 0
             start_time = now
 
-        draw_hud(frame, total_entered, total_exited, live_occupancy, fps, active_tracks, zone_poly)
+        # Get true deduplicated count from the recognition engine
+        true_processed_count = engine.get_session_unique_count()
+
+        draw_hud(frame, true_processed_count, 0, live_occupancy, fps, active_tracks, zone_poly)
 
         cv2.imshow(window_name, frame)
         
@@ -362,10 +427,12 @@ def main():
         if key in (ord('q'), ord('Q'), 27):
             break
         elif key in (ord('r'), ord('R')):
-            total_entered = 0
             total_exited = 0
             tracks_inside.clear()
             track_history.clear()
+            counted_tracks.clear()
+            track_crops.clear()
+            engine.reset_session()
             print("[RESET] Counts and states reset.")
         elif key in (ord('t'), ord('T')):
             draw_trails = not draw_trails
@@ -377,8 +444,10 @@ def main():
             cv2.destroyWindow(window_name)
             zone_poly = zone_drawer.draw_interactive(grabber.read()[1])
             tracks_inside.clear() # Reset state since zone changed
-            total_entered = 0
             total_exited = 0
+            counted_tracks.clear()
+            track_crops.clear()
+            engine.reset_session()
             print("[INFO] Zone updated, counts reset.")
 
     grabber.release()
