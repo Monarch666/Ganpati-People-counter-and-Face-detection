@@ -48,7 +48,7 @@ class FrameGrabber:
             "-pix_fmt", "bgr24",
             "-vcodec",  "rawvideo",
             "-an",                      # no audio
-            "-f",       "rawvideo",
+            "-f",       "image2pipe",
             "pipe:1"
         ]
         return cmd
@@ -59,7 +59,7 @@ class FrameGrabber:
                 self._build_cmd(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=0
+                bufsize=10**8
             )
             self.running = True
             t = threading.Thread(target=self._read_loop, daemon=True)
@@ -68,12 +68,26 @@ class FrameGrabber:
         except Exception as e:
             print(f"[FrameGrabber] Failed to start ffmpeg: {e}")
 
+    def _read_exact(self, size):
+        buf = bytearray()
+        while len(buf) < size:
+            chunk = self.proc.stdout.read(size - len(buf))
+            if not chunk:
+                return bytes(buf)
+            buf.extend(chunk)
+        return bytes(buf)
+
     def _read_loop(self):
         frame_bytes = self.GRAB_WIDTH * self.GRAB_HEIGHT * 3
         while self.running:
-            raw = self.proc.stdout.read(frame_bytes)
+            raw = self._read_exact(frame_bytes)
             if len(raw) != frame_bytes:
-                print("[FrameGrabber] Stream ended or corrupted. Restarting in 3s...")
+                print("[FrameGrabber] Stream ended or corrupted.")
+                # Print stderr to show why ffmpeg died
+                err = self.proc.stderr.read().decode('utf-8', errors='ignore')
+                if err:
+                    print(f"[FrameGrabber] FFmpeg error:\n{err}")
+                print("[FrameGrabber] Restarting in 3s...")
                 time.sleep(3)
                 self._start()
                 return
