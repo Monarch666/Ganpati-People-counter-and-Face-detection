@@ -236,11 +236,14 @@ class LiveFaceDetector:
                 continue
             try:
                 faces = self.app.get(frame)
-                bboxes = [f.bbox for f in faces]
+                face_data = []
+                for f in faces:
+                    kps = f.kps if hasattr(f, "kps") and f.kps is not None else None
+                    face_data.append({"bbox": f.bbox, "kps": kps})
             except Exception:
-                bboxes = []
+                face_data = []
             with self.lock:
-                self.faces = bboxes
+                self.faces = face_data
                 self.latest_frame = None  # signal worker is idle
 
 
@@ -503,11 +506,36 @@ def main():
         # --- Draw Live Face Bounding Boxes ---
         live_detector.submit_frame(frame)  # Non-blocking, skips frames automatically
         current_faces = live_detector.get_faces()
-        for bbox in current_faces:
+        for face_info in current_faces:
+            bbox = face_info["bbox"]
+            kps = face_info["kps"]
             x1_f, y1_f, x2_f, y2_f = map(int, bbox)
+            
+            # Find which YOLO track this face belongs to
+            face_cx = (x1_f + x2_f) / 2
+            face_cy = (y1_f + y2_f) / 2
+            face_id_label = "Face"
+            
+            # Match face to body track if available
+            if results and results[0].boxes and results[0].boxes.id is not None:
+                for box, track_id in zip(results[0].boxes.xyxy.cpu().numpy(), results[0].boxes.id.int().cpu().tolist()):
+                    bx1, by1, bx2, by2 = box
+                    if bx1 <= face_cx <= bx2 and by1 <= face_cy <= by2:
+                        face_id_label = f"ID: {track_id}"
+                        break
+            
+            # Draw the box and label
             cv2.rectangle(frame, (x1_f, y1_f), (x2_f, y2_f), (255, 0, 255), 2)
-            cv2.putText(frame, "FACE", (x1_f, y1_f - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(frame, face_id_label, (x1_f, max(y1_f - 6, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+            
+            # Draw facial landmarks (datapoints)
+            if kps is not None:
+                for idx, pt in enumerate(kps):
+                    kx, ky = int(pt[0]), int(pt[1])
+                    # Alternating red/green dots like the user's reference image
+                    color = (0, 255, 0) if idx % 2 == 0 else (0, 0, 255)
+                    cv2.circle(frame, (kx, ky), 2, color, -1)
 
         # Get true deduplicated count from the recognition engine
         true_processed_count = engine.get_session_unique_count()
