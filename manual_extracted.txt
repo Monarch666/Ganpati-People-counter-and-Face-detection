@@ -1,0 +1,186 @@
+People-Counting System — IP Camera + NVR Reference Manual
+Velvu ST-VB IP2002DL camera · Velvu EZ-NVR-9516K1 NVR · YOLOv8 + ByteTrack pipeline · Windows setup
+TOC \h \o "1-3"
+1. System Overview
+Pipeline: IP Camera (via NVR) → RTSP Stream → Frame Capture → Person Detection (YOLOv8) → Multi-Object Tracking (ByteTrack) → Line-Crossing Logic → Count.
+The critical design point: you never count on raw detections. A single person appears in hundreds of consecutive frames, so counting detections directly inflates numbers massively. The pipeline must:
+Detect people in each frame (YOLOv8, person class only).
+Track each person with a persistent ID across frames (ByteTrack, built into Ultralytics).
+Increment the count only once per tracked ID, when that ID's centroid crosses a defined virtual line.
+2. Hardware in Use
+2.1 Camera — Velvu ST-VB IP2002DL
+Spec
+Value
+Type
+2MP IP Bullet Camera
+Features
+Built-in audio, 24/7 full-color night vision, metal body
+Ingress protection
+IP67 (outdoor rated)
+Lens
+3.6 mm fixed
+Compliance
+ONVIF-compliant
+Connection
+RJ45 (wired Ethernet), typically PoE-powered via NVR
+2.2 Recorder — Velvu EZ-NVR-9516K1
+A networked video recorder (NVR) that all your Velvu IP cameras plug into over PoE/RJ45. The NVR itself becomes the single network endpoint your Python pipeline talks to — you do not need to connect to each camera's own IP separately once it's registered on the NVR.
+The "95" prefix pattern and "16" channel count in this class of Indian-market OEM NVR (commonly Hikvision-derivative firmware, white-labelled) typically indicates a 16-channel PoE NVR. Confirm your exact channel count from the unit's front panel / spec sheet, since RTSP channel numbering depends on it.
+Note: Velvu NVRs in this line are commonly built on Hikvision-compatible firmware. This means the RTSP conventions below (Section 4) are the first thing to try — but always confirm via ONVIF or the NVR's own web UI, since OEM firmware forks occasionally diverge.
+3. Software Stack (Windows)
+Component
+Purpose
+Python 3.10+
+Runtime
+OpenCV (cv2)
+RTSP capture, drawing, frame ops
+Ultralytics YOLOv8
+Detection + built-in ByteTrack tracking
+VLC Media Player
+Verifying the RTSP URL works before writing any code
+ONVIF Device Manager
+Windows GUI tool to discover exact RTSP URIs — avoids guessing
+4. Getting the RTSP Stream from the NVR
+Since all cameras are wired into the NVR, you pull the stream from the NVR's IP — not the camera's individual IP. The NVR exposes one RTSP port (554) and differentiates cameras by channel number in the URL path.
+4.1 Step 1 — Find the NVR's IP address
+Check your router's DHCP client list / connected devices for a device named "NVR" or the Velvu model string.
+Or, on Windows, download and run a Hikvision-compatible discovery tool (SADP Tool works with most OEM-derivative NVRs of this type) — it lists the NVR's IP, MAC and serial without needing credentials.
+Or scan your subnet: open PowerShell and run a simple port sweep on 554/80/8000 across your LAN range.
+4.2 Step 2 — Try the standard NVR RTSP path
+For Hikvision-convention NVRs (which this model is very likely built on), the RTSP path encodes channel + stream type as a 3-digit suffix: channel number, then 01 for main stream / 02 for sub-stream.
+rtsp://<username>:<password>@<NVR_IP>:554/Streaming/Channels/101   # Channel 1, main stream
+rtsp://<username>:<password>@<NVR_IP>:554/Streaming/Channels/102   # Channel 1, sub stream
+rtsp://<username>:<password>@<NVR_IP>:554/Streaming/Channels/201   # Channel 2, main stream
+rtsp://<username>:<password>@<NVR_IP>:554/Streaming/Channels/1601  # Channel 16, main stream
+If that path returns nothing, try the Dahua-style convention as a fallback (some OEM NVR firmware forks use this instead):
+rtsp://<username>:<password>@<NVR_IP>:554/cam/realmonitor?channel=1&subtype=0   # Channel 1, main
+rtsp://<username>:<password>@<NVR_IP>:554/cam/realmonitor?channel=1&subtype=1   # Channel 1, sub
+4.3 Step 3 — Verify in VLC before writing any Python
+Open VLC → Media → Open Network Stream.
+Paste the RTSP URL with your actual NVR IP, admin username and password.
+If video plays, that exact string is what goes into your Python script's rtsp_url variable.
+If it fails, open a browser to http://<NVR_IP> and log into the NVR's own web UI — under Network / RTSP settings, most NVRs of this class will display the exact RTSP port and per-channel path directly.
+Note: Default NVR credentials are almost always admin / (blank or admin) on first boot, but Velvu — like most Indian-market OEM brands — typically forces a password change via its companion mobile app or web UI on first login. Check the sticker on the NVR chassis if unsure.
+4.4 Step 4 — Confirm via ONVIF (most reliable, skips all guessing)
+Since both the camera and (very likely) the NVR are ONVIF-compliant, you can query the exact stream URI programmatically instead of guessing paths:
+pip install onvif-zeep
+from onvif import ONVIFCamera
+cam = ONVIFCamera('<NVR_IP>', 80, 'admin', '<password>')
+media_service = cam.create_media_service()
+profiles = media_service.GetProfiles()
+for i, profile in enumerate(profiles):
+    uri = media_service.GetStreamUri({
+        'StreamSetup': {'Stream': 'RTP-Unicast', 'Transport': {'Protocol': 'RTSP'}},
+        'ProfileToken': profile.token
+    })
+    print(f'Channel/profile {i}: {uri.Uri}')
+5. Windows Environment Setup
+Install Python 3.10+ from python.org — during install, check "Add Python to PATH".
+Open PowerShell (or your Antigravity integrated terminal) in your project folder.
+Create and activate a virtual environment:
+python -m venv venv
+venv\Scripts\activate
+Install dependencies:
+pip install ultralytics opencv-python onvif-zeep
+YOLOv8 will auto-download the nano weights (yolov8n.pt) on first run — no separate download step needed.
+6. Full People-Counting Script
+This is a complete, working script. Paste it directly into a .py file in Antigravity (or any editor) — just replace the rtsp_url with the value you confirmed in Section 4.
+import cv2
+from ultralytics import YOLO
+from collections import defaultdict
+model = YOLO("yolov8n.pt")
+# Replace with the RTSP URL confirmed via VLC/ONVIF in Section 4
+rtsp_url = "rtsp://admin:<password>@<NVR_IP>:554/Streaming/Channels/101"
+cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # reduce latency drift
+LINE_Y = 300  # y-coordinate of the virtual counting line, in pixels
+track_history = defaultdict(list)   # track_id -> recent centroid y-values
+counted_ids = set()
+count_in = 0
+count_out = 0
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        continue
+    results = model.track(
+        frame, persist=True, classes=[0], verbose=False, tracker="bytetrack.yaml"
+    )
+    if results[0].boxes.id is not None:
+        boxes = results[0].boxes.xywh.cpu()
+        track_ids = results[0].boxes.id.int().cpu().tolist()
+        for box, track_id in zip(boxes, track_ids):
+            x, y, w, h = box
+            cy = float(y)
+            track_history[track_id].append(cy)
+            if len(track_history[track_id]) > 30:
+                track_history[track_id].pop(0)
+            if len(track_history[track_id]) >= 2 and track_id not in counted_ids:
+                prev_cy = track_history[track_id][-2]
+                if prev_cy < LINE_Y <= cy:
+                    count_in += 1
+                    counted_ids.add(track_id)
+                elif prev_cy > LINE_Y >= cy:
+                    count_out += 1
+                    counted_ids.add(track_id)
+    annotated = results[0].plot()
+    cv2.line(annotated, (0, LINE_Y), (annotated.shape[1], LINE_Y), (0, 255, 0), 2)
+    cv2.putText(annotated, f"IN: {count_in}  OUT: {count_out}",
+                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    cv2.imshow("People Counter", annotated)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+cap.release()
+cv2.destroyAllWindows()
+How the counting logic works:
+model.track(persist=True) keeps the same ID for a person across frames as long as ByteTrack can associate detections — this survives brief occlusion.
+counted_ids ensures each track ID increments the count exactly once, even if the person lingers near the line.
+Crossing is detected by comparing the previous centroid position to the current one, relative to LINE_Y — this is what prevents double-counting someone standing near the line.
+7. Handling Multiple Channels from the Same NVR
+Run one process per channel — each needs its own VideoCapture and its own tracker instance (trackers must not be shared across channels, or IDs will collide across cameras).
+import multiprocessing
+channels = [101, 201, 301]  # main streams for channels 1, 2, 3
+def run_counter(channel):
+    rtsp_url = f"rtsp://admin:<password>@<NVR_IP>:554/Streaming/Channels/{channel}"
+    # ... same pipeline as Section 6, parameterized by rtsp_url ...
+if __name__ == '__main__':
+    for ch in channels:
+        multiprocessing.Process(target=run_counter, args=(ch,)).start()
+Aggregate counts across processes via a shared SQLite file, Redis, or a small local FastAPI endpoint each process posts to.
+8. Production Hardening
+8.1 RTSP reconnect loop
+NVR-fed RTSP streams drop occasionally over long runs (network hiccups, NVR reboot). Wrap capture in a reconnect loop:
+def robust_capture(rtsp_url):
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            cap.release()
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)  # reconnect
+            continue
+        yield frame
+8.2 Other considerations
+Frame skipping: process every 2nd–3rd frame on modest hardware — tracking tolerates some frame gaps.
+Line placement: perpendicular to the dominant walking direction; avoid spots where people pause (causes flicker across the line → double counts). Add a small dead-zone band around the line if this happens.
+Crowd occlusion: top-down camera mounting reduces person-to-person occlusion versus angled mounting.
+Model size: yolov8n is enough for single-class (person-only) counting — no need for yolov8x unless compute is free.
+9. Calibration & Validation
+Manually count people entering over a 15–30 minute window while the system runs.
+Compare against the script's output — expect 90–98% accuracy with good camera placement.
+Common failure mode: undercounting when two people cross shoulder-to-shoulder (bounding boxes merge). Mitigate with camera height that gives more vertical separation between heads.
+10. Optional Extensions
+Zone-based (not line-based) counting for live occupancy — use a polygon zone instead of a line, tracking entry/exit into the zone.
+Head-only detection for dense crowds where bodies are occluded but heads are visible — requires fine-tuning a head-detection model rather than stock COCO person class.
+Pipe counts into Grafana/InfluxDB for a historical dashboard.
+11. Quick Troubleshooting Checklist
+Symptom
+Likely Cause / Fix
+VLC can't connect to RTSP URL
+Wrong credentials, wrong channel number, or RTSP port blocked — check NVR web UI network settings
+VLC works, but cv2.VideoCapture returns ret=False
+Missing FFmpeg backend — ensure opencv-python (not headless-only builds without codecs) and pass cv2.CAP_FFMPEG explicitly
+Counts far too high
+Tracker not persisting IDs correctly — confirm persist=True and that you're not creating a new YOLO() model instance per frame
+Counts too low / missed people
+Line placed where people pause, or heavy occlusion — reposition line or camera angle per Section 8.2
+Stream freezes after a few minutes
+RTSP drop — implement the reconnect loop in Section 8.1
